@@ -90,16 +90,16 @@ int run_app(int argc, char** argv) {
 
   if (options.mode.empty() || options.mode == "gui") {
     if (!gui_support_available()) {
-      std::cerr << "GUI support is unavailable\n";
-      return 1;
+      std::cerr << "GUI support is unavailable; using viewer mode\n";
+      return run_viewer_mode(options);
     }
     return run_gui_app(argc, argv);
   }
 
   if (options.mode == "gui") {
     if (!gui_support_available()) {
-      std::cerr << "gui mode requested but GUI support is unavailable\n";
-      return 1;
+      std::cerr << "gui mode requested but GUI support is unavailable; using viewer mode\n";
+      return run_viewer_mode(options);
     }
     return run_gui_app(argc, argv);
   }

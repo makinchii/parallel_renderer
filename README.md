@@ -1,6 +1,6 @@
 # Parallel Renderer
 
-CPU ray tracer with a GUI shell for rendering, benchmarking, and inspection.
+CPU ray tracer with a GUI shell when SDL3 and ImGui are available, plus a terminal viewer fallback.
 
 ## Setup
 
@@ -9,10 +9,10 @@ Ubuntu WSL, using `apt`:
 ```bash
 sudo add-apt-repository universe
 sudo apt update
-sudo apt install build-essential cmake pkg-config libsdl3-dev libimgui-dev
+sudo apt install build-essential cmake pkg-config libimgui-dev
 ```
 
-If `libsdl3-dev` is unavailable on your Ubuntu release, upgrade to a release that packages SDL3. This project expects both SDL3 and Dear ImGui to come from system packages.
+GUI mode is optional. If SDL3 is available on your system, the app will use it automatically; otherwise it falls back to the terminal viewer and still runs.
 
 ## Build
 
