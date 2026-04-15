@@ -42,11 +42,13 @@ struct ViewerState {
   std::vector<Tile> tiles;
   std::vector<TileStatus> tile_status;
   std::deque<TileUpdate> tile_updates;
+  std::vector<TileUpdate> tile_update_buffer;
   std::atomic<int> tiles_completed{0};
   std::atomic<bool> paused{false};
   std::atomic<bool> cancelled{false};
   std::atomic<bool> render_complete{false};
   std::mutex mutex;
+  std::mutex framebuffer_mutex;
   std::deque<std::string> logs;
 
   ViewerState();

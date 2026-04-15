@@ -125,4 +125,28 @@ int run_app(int argc, char** argv) {
   return 1;
 }
 
+int run_cli_app(int argc, char** argv) {
+  auto options = cli::parse_args(argc, argv);
+
+  if (options.mode.empty() || options.mode == "render") {
+    return run_render_mode(options);
+  }
+
+  if (options.mode == "benchmark") {
+    return run_benchmark_mode(options);
+  }
+
+  if (options.mode == "viewer" || options.config.viewer_enabled) {
+    return run_viewer_mode(options);
+  }
+
+  if (options.mode == "test") {
+    return run_self_tests() ? 0 : 1;
+  }
+
+  std::cerr << "unknown mode: " << options.mode << '\n';
+  cli::usage();
+  return 1;
+}
+
 }  // namespace pr

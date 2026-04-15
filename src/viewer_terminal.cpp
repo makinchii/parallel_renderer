@@ -64,6 +64,7 @@ static std::string draw_tile_overlay(const ViewerState& state, int columns = 24)
 
 void print_viewer_frame(ViewerState& state, const RenderStats& stats, const RenderConfig& config) {
   std::lock_guard<std::mutex> lock(state.mutex);
+  std::lock_guard<std::mutex> framebuffer_lock(state.framebuffer_mutex);
   const Framebuffer& framebuffer = state.framebuffer_ref();
   std::cout << "\033[2J\033[H";
   std::cout << "Parallel Renderer Viewer\n";

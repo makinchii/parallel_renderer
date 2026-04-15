@@ -8,7 +8,7 @@ namespace pr::cli {
 
 struct Options {
   RenderConfig config;
-  std::string mode = "gui";
+  std::string mode = "render";
   std::string threads_arg;
   std::string schedule_arg;
 };

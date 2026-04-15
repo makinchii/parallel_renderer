@@ -7,10 +7,10 @@ namespace pr::cli {
 
 void usage() {
   std::cout << "Usage: renderer [options]\n"
-            << "  --mode gui|viewer|benchmark|render|test\n"
-            << "  --scene simple|medium|heavy|cornell|tilted\n"
-            << "  --width N --height N --spp N --depth N\n"
-            << "  --threads N or N,N,N --schedule serial|static|dynamic or list\n"
+             << "  --mode gui|viewer|benchmark|render|test\n"
+             << "  --scene simple|medium|heavy\n"
+             << "  --width N --height N --spp N --depth N\n"
+             << "  --threads N or N,N,N --schedule serial|static|dynamic or list\n"
             << "  --tile N --seed N\n"
             << "  --save output.png\n"
             << "  --csv results.csv --runs N\n";
@@ -70,7 +70,7 @@ Options parse_args(int argc, char** argv) {
     }
   }
 
-  if (options.mode.empty()) options.mode = "gui";
+  if (options.mode.empty()) options.mode = "render";
 
   return options;
 }

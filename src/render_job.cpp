@@ -93,7 +93,7 @@ std::vector<TileUpdate> RenderJob::consume_tile_updates() const {
 }
 
 Framebuffer RenderJob::snapshot() const {
-  std::lock_guard<std::mutex> lock(viewer_state_.mutex);
+  std::lock_guard<std::mutex> lock(viewer_state_.framebuffer_mutex);
   return viewer_state_.framebuffer_ref();
 }
 

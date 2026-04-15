@@ -38,7 +38,7 @@ static bool try_sdl_video_init_with_driver(const char* driver_name) {
   if (SDL_Init(SDL_INIT_VIDEO)) {
     return true;
   }
-  std::cerr << "SDL_Init(" << (driver_name ? driver_name : "default") << ") failed: " << SDL_GetError() << '\n';
+    std::cerr << "SDL_Init(" << (driver_name ? driver_name : "default") << ") failed: " << SDL_GetError() << '\n';
   SDL_Quit();
   return false;
 }
@@ -57,6 +57,29 @@ static bool sdl_set_texture_from_framebuffer(SDL_Texture* texture, const Framebu
     auto* row = dst + static_cast<std::size_t>(y) * static_cast<std::size_t>(dst_pitch);
     for (int x = 0; x < framebuffer.width; ++x) {
       row[x] = 0xff000000u | framebuffer.at(x, y);
+    }
+  }
+  SDL_UnlockTexture(texture);
+  return true;
+}
+
+static bool sdl_set_texture_tile(SDL_Texture* texture, const Tile& tile, const std::vector<std::uint32_t>& pixels) {
+  if (!texture || pixels.empty()) return false;
+  SDL_Rect rect{tile.x0, tile.y0, tile.x1 - tile.x0, tile.y1 - tile.y0};
+  void* dst_pixels = nullptr;
+  int pitch = 0;
+  if (!SDL_LockTexture(texture, &rect, &dst_pixels, &pitch)) {
+    std::cerr << "SDL_LockTexture(tile) failed: " << SDL_GetError() << '\n';
+    return false;
+  }
+  auto* dst = static_cast<std::uint32_t*>(dst_pixels);
+  int dst_pitch = pitch / static_cast<int>(sizeof(std::uint32_t));
+  int tile_w = rect.w;
+  int tile_h = rect.h;
+  for (int y = 0; y < tile_h; ++y) {
+    for (int x = 0; x < tile_w; ++x) {
+      dst[static_cast<std::size_t>(y) * static_cast<std::size_t>(dst_pitch) + static_cast<std::size_t>(x)] =
+          0xff000000u | pixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(tile_w) + static_cast<std::size_t>(x)];
     }
   }
   SDL_UnlockTexture(texture);
@@ -282,6 +305,8 @@ SdlViewerResult run_sdl_viewer(const Scene& scene, const Camera& camera, const R
     return result;
   }
 
+  Framebuffer viewer_framebuffer(config.width, config.height);
+
   if (!SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND)) {
     std::cerr << "SDL_SetRenderDrawBlendMode failed: " << SDL_GetError() << '\n';
   }
@@ -293,10 +318,38 @@ SdlViewerResult run_sdl_viewer(const Scene& scene, const Camera& camera, const R
   bool running = true;
   auto last_draw = std::chrono::steady_clock::now();
   bool render_joined = false;
+  RenderOverlaySnapshot overlay_layout = job->overlay_snapshot();
+  auto apply_tile_updates = [&]() {
+    auto updates = job->consume_tile_updates();
+    bool needs_full_refresh = false;
+    for (auto& update : updates) {
+      if (update.id < 0) continue;
+      if (update.id >= static_cast<int>(overlay_layout.tiles.size())) {
+        continue;
+      }
+      if (!update.pixels.empty()) {
+        const auto& tile = overlay_layout.tiles[static_cast<std::size_t>(update.id)];
+        for (int y = tile.y0; y < tile.y1; ++y) {
+          for (int x = tile.x0; x < tile.x1; ++x) {
+            viewer_framebuffer.at(x, y) = update.pixels[static_cast<std::size_t>(y - tile.y0) * static_cast<std::size_t>(tile.x1 - tile.x0) + static_cast<std::size_t>(x - tile.x0)];
+          }
+        }
+        if (!sdl_set_texture_tile(texture, tile, update.pixels)) {
+          needs_full_refresh = true;
+        }
+      }
+    }
+    if (needs_full_refresh && !sdl_set_texture_from_framebuffer(texture, viewer_framebuffer)) {
+      std::cerr << "SDL_UpdateTexture failed: " << SDL_GetError() << '\n';
+      job->cancel();
+      running = false;
+      result.cancelled = true;
+    }
+  };
   while (running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-      if (event.type == SDL_EVENT_QUIT) {
+        if (event.type == SDL_EVENT_QUIT) {
         job->cancel();
         running = false;
         result.cancelled = true;
@@ -312,17 +365,10 @@ SdlViewerResult run_sdl_viewer(const Scene& scene, const Camera& camera, const R
     }
 
     auto now = std::chrono::steady_clock::now();
+    apply_tile_updates();
     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_draw).count() >= refresh_ms) {
       auto progress = job->progress();
       double elapsed_ms = progress.elapsed_seconds * 1000.0;
-      Framebuffer snapshot = job->snapshot();
-      if (!sdl_set_texture_from_framebuffer(texture, snapshot)) {
-        std::cerr << "SDL_UpdateTexture failed: " << SDL_GetError() << '\n';
-        job->cancel();
-        running = false;
-        result.cancelled = true;
-        break;
-      }
       SDL_RenderClear(renderer);
       SDL_RenderTexture(renderer, texture, nullptr, nullptr);
       auto overlay = job->overlay_snapshot();
@@ -342,15 +388,8 @@ SdlViewerResult run_sdl_viewer(const Scene& scene, const Camera& camera, const R
     if (job->is_complete() && !render_joined) {
       job->join();
       render_joined = true;
-      if (config.save_output) framebuffer = job->snapshot();
-      Framebuffer snapshot = job->snapshot();
-      if (!sdl_set_texture_from_framebuffer(texture, snapshot)) {
-        std::cerr << "SDL_UpdateTexture failed: " << SDL_GetError() << '\n';
-        job->cancel();
-        running = false;
-        result.cancelled = true;
-        break;
-      }
+      apply_tile_updates();
+      if (config.save_output) framebuffer = viewer_framebuffer;
       SDL_RenderClear(renderer);
       SDL_RenderTexture(renderer, texture, nullptr, nullptr);
       auto overlay = job->overlay_snapshot();
@@ -363,9 +402,8 @@ SdlViewerResult run_sdl_viewer(const Scene& scene, const Camera& camera, const R
   }
 
   if (!render_joined) job->join();
-  if (config.save_output) framebuffer = job->snapshot();
-  Framebuffer snapshot = job->snapshot();
-  sdl_set_texture_from_framebuffer(texture, snapshot);
+  apply_tile_updates();
+  if (config.save_output) framebuffer = viewer_framebuffer;
   SDL_RenderClear(renderer);
   SDL_RenderTexture(renderer, texture, nullptr, nullptr);
   {

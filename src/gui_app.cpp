@@ -7,6 +7,7 @@
 #include "render_job.h"
 #include "png_writer.h"
 #include "scene_registry.h"
+#include "benchmark_analysis.h"
 #include "viewer_sdl.h"
 #include "viewer_state.h"
 
@@ -17,15 +18,20 @@
 #include <imgui_stdlib.h>
 #include <backends/imgui_impl_sdl3.h>
 #include <backends/imgui_impl_sdlrenderer3.h>
+#include <implot.h>
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <cmath>
 #include <deque>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -37,7 +43,7 @@ namespace pr {
 namespace {
 
 struct GuiAppState {
-  enum class Page { Home, Render, Benchmark, Results, Diagnostics };
+  enum class Page { Home, Render, Benchmark, Results, Charts, Diagnostics };
 
   RenderController controller;
   RenderConfig config;
@@ -69,6 +75,15 @@ struct GuiAppState {
   std::string benchmark_schedules = "serial,dynamic";
   std::deque<std::string> benchmark_rows;
   std::deque<std::string> benchmark_log;
+  std::string results_csv_path = "";
+  std::string results_status = "No benchmark CSV selected";
+  std::string results_browser_dir = "./results";
+  BenchmarkDataset results_dataset;
+  int results_compare_a = -1;
+  int results_compare_b = -1;
+  std::thread results_worker;
+  std::atomic<bool> results_loading{false};
+  std::mutex results_mutex;
   std::string diagnostics_text;
   std::thread benchmark_worker;
   std::mutex benchmark_mutex;
@@ -445,12 +460,7 @@ static void update_job_output(GuiAppState& state, SDL_Renderer* renderer) {
 
   auto refresh_overlay_states = [&]() {
     if (!state.job) return;
-    if (!refresh_overlay_cache()) return;
-    auto latest = state.job->overlay_snapshot();
-    if (latest.tiles.size() == latest.tile_status.size() && !latest.tiles.empty()) {
-      state.overlay_cache = std::move(latest);
-      state.overlay_cache_valid = true;
-    }
+    refresh_overlay_cache();
   };
 
   auto consume_tile_updates = [&]() {
@@ -510,7 +520,6 @@ static void update_job_output(GuiAppState& state, SDL_Renderer* renderer) {
 
     consume_tile_updates();
     process_tile_updates();
-    refresh_overlay_states();
     state.last_uploaded_tiles_completed = progress.tiles_completed;
 
     if (state.job->is_complete() && !state.job_joined) {
@@ -553,6 +562,17 @@ static void add_hover_tooltip(const char* text) {
   }
 }
 
+static void table_header_cell(const char* label, const char* tooltip) {
+  ImGui::TextUnformatted(label);
+  add_hover_tooltip(tooltip);
+}
+
+static std::string benchmark_summary_label(const BenchmarkConfigSummary& summary) {
+  std::ostringstream oss;
+  oss << summary.key.threads << " threads | " << summary.key.schedule;
+  return oss.str();
+}
+
 static void draw_control_panel(SDL_Window* window, GuiAppState& state);
 
 static const char* page_name(GuiAppState::Page page) {
@@ -561,6 +581,7 @@ static const char* page_name(GuiAppState::Page page) {
     case GuiAppState::Page::Render: return "Render";
     case GuiAppState::Page::Benchmark: return "Benchmark";
     case GuiAppState::Page::Results: return "Results";
+    case GuiAppState::Page::Charts: return "Charts";
     case GuiAppState::Page::Diagnostics: return "Diagnostics";
   }
   return "Home";
@@ -576,6 +597,8 @@ static void draw_navigation(GuiAppState& state) {
       {GuiAppState::Page::Home, "Home"},
       {GuiAppState::Page::Render, "Render"},
       {GuiAppState::Page::Benchmark, "Benchmark"},
+      {GuiAppState::Page::Results, "Results"},
+      {GuiAppState::Page::Charts, "Charts"},
       {GuiAppState::Page::Diagnostics, "Diagnostics"},
   };
   for (const auto& item : items) {
@@ -721,6 +744,369 @@ static void draw_benchmark_page(GuiAppState& state) {
   ImGui::EndChild();
 }
 
+static std::vector<std::string> load_csv_rows(const std::string& path) {
+  std::vector<std::string> rows;
+  std::ifstream in(path);
+  if (!in) return rows;
+  std::string line;
+  bool first = true;
+  while (std::getline(in, line)) {
+    if (first) {
+      first = false;
+      continue;
+    }
+    if (!line.empty()) rows.push_back(line);
+  }
+  return rows;
+}
+
+static void load_results_csv(GuiAppState& state, const std::string& path) {
+  if (path.empty()) return;
+  state.results_csv_path = path;
+  state.results_status = "Loading CSV...";
+  state.results_loading.store(true);
+  if (state.results_worker.joinable()) state.results_worker.join();
+  state.results_worker = std::thread([&state, path] {
+    BenchmarkDataset dataset;
+    std::string error;
+    bool ok = load_benchmark_csv(path, dataset, error);
+    {
+      std::lock_guard<std::mutex> guard(state.results_mutex);
+      if (!ok) {
+        state.results_status = error.empty() ? "CSV load failed" : error;
+        state.results_dataset = BenchmarkDataset{};
+        state.results_compare_a = -1;
+        state.results_compare_b = -1;
+      } else {
+        state.results_dataset = std::move(dataset);
+        state.results_status = "CSV loaded";
+        auto find_config_index = [&](const BenchmarkConfigKey& key) -> int {
+          for (int i = 0; i < static_cast<int>(state.results_dataset.configs.size()); ++i) {
+            const auto& cfg = state.results_dataset.configs[static_cast<std::size_t>(i)];
+            if (cfg.key.threads == key.threads && cfg.key.schedule == key.schedule) return i;
+          }
+          return -1;
+        };
+        state.results_compare_a = find_config_index(state.results_dataset.workload.baseline_config);
+        state.results_compare_b = find_config_index(state.results_dataset.workload.best_config);
+        if (state.results_compare_a < 0 && !state.results_dataset.configs.empty()) state.results_compare_a = 0;
+        if (state.results_compare_b < 0) {
+          state.results_compare_b = state.results_dataset.configs.size() > 1 ? 1 : state.results_compare_a;
+        }
+        if (state.results_compare_a == state.results_compare_b && state.results_dataset.configs.size() > 1) {
+          state.results_compare_b = (state.results_compare_a + 1) % static_cast<int>(state.results_dataset.configs.size());
+        }
+      }
+      state.results_loading.store(false);
+    }
+  });
+}
+
+static void draw_benchmark_dataset_panel(SDL_Window*, GuiAppState& state) {
+  (void)state;
+  ImGui::TextUnformatted("Benchmark CSV Source");
+  ImGui::Separator();
+
+  ImGui::InputText("CSV Path", &state.results_csv_path);
+  add_hover_tooltip("Type or paste a benchmark CSV path, or choose one from the browser below.");
+  if (ImGui::Button(state.results_loading.load() ? "Loading..." : "Load CSV")) {
+    load_results_csv(state, state.results_csv_path);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Up")) {
+    std::filesystem::path current = state.results_browser_dir;
+    state.results_browser_dir = current.parent_path().empty() ? "." : current.parent_path().string();
+  }
+
+  ImGui::Text("Browse: %s", state.results_browser_dir.c_str());
+  ImGui::Text("CSV Path: %s", state.results_csv_path.c_str());
+  ImGui::BeginChild("ResultsBrowser", ImVec2(0, 140.0f * state.ui_scale), true, ImGuiWindowFlags_HorizontalScrollbar);
+  try {
+    for (const auto& entry : std::filesystem::directory_iterator(state.results_browser_dir)) {
+      const auto name = entry.path().filename().string();
+      const bool is_dir = entry.is_directory();
+      const bool is_csv = entry.is_regular_file() && entry.path().extension() == ".csv";
+      if (!is_dir && !is_csv) continue;
+      std::string label = is_dir ? "[DIR] " + name : name;
+      if (ImGui::Selectable(label.c_str(), false)) {
+        if (is_dir) {
+          state.results_browser_dir = entry.path().string();
+        } else {
+          state.results_csv_path = entry.path().string();
+          load_results_csv(state, state.results_csv_path);
+        }
+      }
+    }
+  } catch (...) {
+    ImGui::TextUnformatted("Unable to open directory.");
+  }
+  ImGui::EndChild();
+
+  {
+    std::lock_guard<std::mutex> lock(state.results_mutex);
+    ImGui::Text("Status: %s", state.results_status.c_str());
+    ImGui::Text("CSV: %s", state.results_dataset.csv_path.string().c_str());
+    ImGui::Text("Rows: %zu", state.results_dataset.rows.size());
+    ImGui::Text("Config groups: %zu", state.results_dataset.configs.size());
+    ImGui::Text("Workload: %s", benchmark_workload_label(state.results_dataset.workload).c_str());
+    if (!state.results_dataset.configs.empty()) {
+      ImGui::Text("Baseline config: %s", benchmark_config_label(state.results_dataset.workload.baseline_config).c_str());
+      ImGui::Text("Baseline serial ms: %.2f", state.results_dataset.workload.baseline_serial_ms);
+      ImGui::Text("Speedup basis: baseline serial median / config median");
+      ImGui::TextWrapped("Values below 1.0x are slower than the baseline. Serial schedule ignores extra threads, so serial rows with higher thread counts should stay near 1.0x.");
+      ImGui::Text("Ideal speedup @ max threads: %.2fx", state.results_dataset.workload.ideal_linear_speedup);
+      ImGui::Text("Ideal runtime @ max threads: %.2f ms", state.results_dataset.workload.ideal_runtime_ms);
+      ImGui::Text("Best config: %s", benchmark_config_label(state.results_dataset.workload.best_config).c_str());
+      ImGui::Text("Best observed speedup: %.2fx", state.results_dataset.workload.best_observed_speedup);
+      ImGui::Text("Fastest observed ms: %.2f ms", state.results_dataset.workload.best_observed_ms);
+    }
+  }
+}
+
+static void draw_results_page(SDL_Window* window, GuiAppState& state) {
+  ImGui::TextUnformatted("Results");
+  ImGui::Separator();
+  draw_benchmark_dataset_panel(window, state);
+
+  {
+    std::lock_guard<std::mutex> lock(state.results_mutex);
+    if (!state.results_dataset.configs.empty()) {
+      ImGui::Separator();
+      ImGui::TextUnformatted("Config Comparison");
+      ImGui::Separator();
+      const char* preview_items = "Select two configs";
+      if (ImGui::BeginCombo("Config A", state.results_compare_a >= 0 && state.results_compare_a < static_cast<int>(state.results_dataset.configs.size()) ? benchmark_config_label(state.results_dataset.configs[static_cast<std::size_t>(state.results_compare_a)].key).c_str() : preview_items)) {
+        for (int i = 0; i < static_cast<int>(state.results_dataset.configs.size()); ++i) {
+          const auto& summary = state.results_dataset.configs[static_cast<std::size_t>(i)];
+          std::string label = benchmark_config_label(summary.key);
+          if (ImGui::Selectable(label.c_str(), state.results_compare_a == i)) state.results_compare_a = i;
+        }
+        ImGui::EndCombo();
+      }
+      if (ImGui::BeginCombo("Config B", state.results_compare_b >= 0 && state.results_compare_b < static_cast<int>(state.results_dataset.configs.size()) ? benchmark_config_label(state.results_dataset.configs[static_cast<std::size_t>(state.results_compare_b)].key).c_str() : preview_items)) {
+        for (int i = 0; i < static_cast<int>(state.results_dataset.configs.size()); ++i) {
+          const auto& summary = state.results_dataset.configs[static_cast<std::size_t>(i)];
+          std::string label = benchmark_config_label(summary.key);
+          if (ImGui::Selectable(label.c_str(), state.results_compare_b == i)) state.results_compare_b = i;
+        }
+        ImGui::EndCombo();
+      }
+
+      const BenchmarkConfigSummary* a = nullptr;
+      const BenchmarkConfigSummary* b = nullptr;
+      if (state.results_compare_a >= 0 && state.results_compare_a < static_cast<int>(state.results_dataset.configs.size())) a = &state.results_dataset.configs[static_cast<std::size_t>(state.results_compare_a)];
+      if (state.results_compare_b >= 0 && state.results_compare_b < static_cast<int>(state.results_dataset.configs.size())) b = &state.results_dataset.configs[static_cast<std::size_t>(state.results_compare_b)];
+      if (a && b) {
+        ImGui::BeginChild("ResultsComparison", ImVec2(0, 150.0f * state.ui_scale), true, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::Text("%-14s %-16s %-16s", "Metric", "Config A", "Config B");
+        ImGui::Separator();
+        ImGui::Text("%-14s %-16.2f %-16.2f", "Config avg ms", a->avg_ms, b->avg_ms);
+        ImGui::Text("%-14s %-16.2f %-16.2f", "Median ms", a->median_ms, b->median_ms);
+        ImGui::Text("%-14s %-16.2f %-16.2f", "Stddev ms", a->stddev_ms, b->stddev_ms);
+        ImGui::Text("%-14s %-16.1f %-16.1f", "Avg pps", a->avg_pixels_per_sec, b->avg_pixels_per_sec);
+        ImGui::Text("%-14s %-16.2fx %-16.2fx", "Observed speedup", a->observed_speedup, b->observed_speedup);
+        ImGui::Text("%-14s %-16.2f %-16.2f", "Efficiency", a->efficiency, b->efficiency);
+        ImGui::EndChild();
+      }
+    }
+
+    ImGui::BeginChild("ResultsSummary", ImVec2(0, 220.0f * state.ui_scale), true, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::TextUnformatted("Config Summary");
+    ImGui::Separator();
+    if (ImGui::BeginTable("ConfigSummaryTable", 11, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_ScrollY)) {
+      ImGui::TableSetupScrollFreeze(0, 1);
+      ImGui::TableSetupColumn("Threads");
+      ImGui::TableSetupColumn("Schedule");
+      ImGui::TableSetupColumn("Rows");
+      ImGui::TableSetupColumn("Min ms");
+      ImGui::TableSetupColumn("Max ms");
+      ImGui::TableSetupColumn("Avg ms");
+      ImGui::TableSetupColumn("Median ms");
+      ImGui::TableSetupColumn("Stddev ms");
+      ImGui::TableSetupColumn("Avg pps");
+      ImGui::TableSetupColumn("Speedup vs baseline");
+      ImGui::TableSetupColumn("Efficiency");
+      ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+      ImGui::TableNextColumn(); table_header_cell("Threads", "Thread count used by this configuration group.");
+      ImGui::TableNextColumn(); table_header_cell("Schedule", "Scheduling mode used by this configuration group.");
+      ImGui::TableNextColumn(); table_header_cell("Rows", "Benchmark rows in this configuration group.");
+      ImGui::TableNextColumn(); table_header_cell("Min ms", "Fastest run time in this group.");
+      ImGui::TableNextColumn(); table_header_cell("Max ms", "Slowest run time in this group.");
+      ImGui::TableNextColumn(); table_header_cell("Avg ms", "Average run time in this group.");
+      ImGui::TableNextColumn(); table_header_cell("Median ms", "Median run time in this group.");
+      ImGui::TableNextColumn(); table_header_cell("Stddev ms", "Standard deviation of run times in this group.");
+      ImGui::TableNextColumn(); table_header_cell("Avg pps", "Average pixels per second in this group.");
+      ImGui::TableNextColumn(); table_header_cell("Speedup vs baseline", "Baseline serial time divided by this group's median time.");
+      ImGui::TableNextColumn(); table_header_cell("Efficiency", "Observed speedup divided by the thread count.");
+
+      for (const auto& summary : state.results_dataset.configs) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::Text("%d", summary.key.threads);
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(summary.key.schedule.c_str());
+        ImGui::TableNextColumn(); ImGui::Text("%zu", summary.row_count);
+        ImGui::TableNextColumn(); ImGui::Text("%.2f", summary.min_ms);
+        ImGui::TableNextColumn(); ImGui::Text("%.2f", summary.max_ms);
+        ImGui::TableNextColumn(); ImGui::Text("%.2f", summary.avg_ms);
+        ImGui::TableNextColumn(); ImGui::Text("%.2f", summary.median_ms);
+        ImGui::TableNextColumn(); ImGui::Text("%.2f", summary.stddev_ms);
+        ImGui::TableNextColumn(); ImGui::Text("%.1f", summary.avg_pixels_per_sec);
+        ImGui::TableNextColumn(); ImGui::Text("%.2fx", summary.observed_speedup);
+        ImGui::TableNextColumn(); ImGui::Text("%.2f", summary.efficiency);
+      }
+      ImGui::EndTable();
+    }
+    ImGui::EndChild();
+  }
+}
+
+static void draw_charts_page(SDL_Window* window, GuiAppState& state) {
+  ImGui::TextUnformatted("Charts");
+  ImGui::Separator();
+
+  draw_benchmark_dataset_panel(window, state);
+
+  BenchmarkDataset snapshot;
+  {
+    std::lock_guard<std::mutex> lock(state.results_mutex);
+    snapshot = state.results_dataset;
+  }
+
+  if (snapshot.configs.empty()) {
+    ImGui::Separator();
+    ImGui::TextDisabled("Load a benchmark CSV to view charts.");
+    return;
+  }
+
+  if (snapshot.configs.empty()) {
+    ImGui::Separator();
+    ImGui::TextDisabled("No chartable config groups found.");
+    return;
+  }
+
+  auto show_point_tooltip = [&](auto value_getter, const char* metric_label) {
+    if (!ImPlot::IsPlotHovered()) return;
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    const BenchmarkConfigSummary* nearest = nullptr;
+    double nearest_value = 0.0;
+    double nearest_dist = 12.0;
+    for (const auto& summary : snapshot.configs) {
+      const double x = static_cast<double>(summary.key.threads);
+      const double y = static_cast<double>(value_getter(summary));
+      const ImVec2 p = ImPlot::PlotToPixels(x, y);
+      const double dx = static_cast<double>(mouse.x - p.x);
+      const double dy = static_cast<double>(mouse.y - p.y);
+      const double dist = std::sqrt(dx * dx + dy * dy);
+      if (dist < nearest_dist) {
+        nearest_dist = dist;
+        nearest = &summary;
+        nearest_value = y;
+      }
+    }
+
+    if (!nearest) return;
+    std::string label = benchmark_config_label(nearest->key);
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(label.c_str());
+    ImGui::Text("Threads: %d", nearest->key.threads);
+    ImGui::Text("Schedule: %s", nearest->key.schedule.c_str());
+    ImGui::Text("%s: %.3f", metric_label, nearest_value);
+    ImGui::Text("Median ms: %.2f", nearest->median_ms);
+    ImGui::Text("Observed speedup: %.2fx", nearest->observed_speedup);
+    ImGui::Text("Efficiency: %.2f", nearest->efficiency);
+    ImGui::EndTooltip();
+  };
+
+  ImGui::Separator();
+  if (ImPlot::BeginPlot("Observed Speedup", ImVec2(-1, 260.0f * state.ui_scale))) {
+    ImPlot::SetupAxes("Threads", "Speedup");
+    ImPlot::SetupLegend(ImPlotLocation_NorthEast, ImPlotLegendFlags_Outside);
+    std::map<std::string, std::vector<const BenchmarkConfigSummary*>> grouped;
+    for (const auto& summary : snapshot.configs) grouped[summary.key.schedule].push_back(&summary);
+    for (auto& [schedule, configs] : grouped) {
+      std::sort(configs.begin(), configs.end(), [](const BenchmarkConfigSummary* a, const BenchmarkConfigSummary* b) {
+        return a->key.threads < b->key.threads;
+      });
+      std::vector<double> xs, ys;
+      xs.reserve(configs.size());
+      ys.reserve(configs.size());
+      for (const auto* cfg : configs) {
+        xs.push_back(static_cast<double>(cfg->key.threads));
+        ys.push_back(cfg->observed_speedup);
+      }
+      ImU32 color = schedule == "serial" ? IM_COL32(223, 165, 91, 255) : schedule == "static" ? IM_COL32(102, 179, 255, 255) : IM_COL32(124, 214, 142, 255);
+      ImPlot::PlotLine(schedule.c_str(), xs.data(), ys.data(), static_cast<int>(xs.size()), ImPlotSpec{ImPlotProp_LineColor, color, ImPlotProp_Marker, ImPlotMarker_Circle, ImPlotProp_MarkerSize, 5.0f});
+    }
+    double max_threads = 1.0;
+    for (const auto& summary : snapshot.configs) max_threads = std::max(max_threads, static_cast<double>(summary.key.threads));
+    std::vector<double> ideal_x{1.0, max_threads};
+    std::vector<double> ideal_y{1.0, max_threads};
+    ImPlot::PlotLine("Ideal", ideal_x.data(), ideal_y.data(), 2, ImPlotSpec{ImPlotProp_LineColor, IM_COL32(255, 210, 90, 180), ImPlotProp_LineWeight, 1.5f});
+    show_point_tooltip([](const BenchmarkConfigSummary& summary) { return summary.observed_speedup; }, "Observed speedup");
+    ImPlot::EndPlot();
+  }
+
+  if (ImPlot::BeginPlot("Median Runtime", ImVec2(-1, 260.0f * state.ui_scale))) {
+    ImPlot::SetupAxes("Threads", "Milliseconds");
+    ImPlot::SetupLegend(ImPlotLocation_NorthEast, ImPlotLegendFlags_Outside);
+    std::map<std::string, std::vector<const BenchmarkConfigSummary*>> grouped;
+    for (const auto& summary : snapshot.configs) grouped[summary.key.schedule].push_back(&summary);
+    std::vector<double> thread_samples;
+    thread_samples.reserve(snapshot.configs.size());
+    for (const auto& summary : snapshot.configs) thread_samples.push_back(static_cast<double>(summary.key.threads));
+    for (auto& [schedule, configs] : grouped) {
+      std::sort(configs.begin(), configs.end(), [](const BenchmarkConfigSummary* a, const BenchmarkConfigSummary* b) {
+        return a->key.threads < b->key.threads;
+      });
+      std::vector<double> xs, ys;
+      xs.reserve(configs.size());
+      ys.reserve(configs.size());
+      for (const auto* cfg : configs) {
+        xs.push_back(static_cast<double>(cfg->key.threads));
+        ys.push_back(cfg->median_ms);
+      }
+      ImU32 color = schedule == "serial" ? IM_COL32(223, 165, 91, 255) : schedule == "static" ? IM_COL32(102, 179, 255, 255) : IM_COL32(124, 214, 142, 255);
+      ImPlot::PlotLine(schedule.c_str(), xs.data(), ys.data(), static_cast<int>(xs.size()), ImPlotSpec{ImPlotProp_LineColor, color, ImPlotProp_Marker, ImPlotMarker_Circle, ImPlotProp_MarkerSize, 5.0f});
+    }
+    const double baseline_ms = snapshot.workload.baseline_serial_ms;
+    std::vector<double> base_y(thread_samples.size(), baseline_ms);
+    std::vector<double> ideal_y;
+    ideal_y.reserve(thread_samples.size());
+    for (double x : thread_samples) ideal_y.push_back(baseline_ms / std::max(1.0, x));
+    ImPlot::PlotLine("Baseline", thread_samples.data(), base_y.data(), static_cast<int>(thread_samples.size()), ImPlotSpec{ImPlotProp_LineColor, IM_COL32(255, 255, 255, 120), ImPlotProp_LineWeight, 1.5f});
+    ImPlot::PlotLine("Ideal", thread_samples.data(), ideal_y.data(), static_cast<int>(ideal_y.size()), ImPlotSpec{ImPlotProp_LineColor, IM_COL32(102, 179, 255, 180), ImPlotProp_LineWeight, 1.5f});
+    show_point_tooltip([](const BenchmarkConfigSummary& summary) { return summary.median_ms; }, "Median runtime (ms)");
+    ImPlot::EndPlot();
+  }
+
+  if (ImPlot::BeginPlot("Efficiency", ImVec2(-1, 260.0f * state.ui_scale))) {
+    ImPlot::SetupAxes("Threads", "Efficiency");
+    ImPlot::SetupLegend(ImPlotLocation_NorthEast, ImPlotLegendFlags_Outside);
+    std::map<std::string, std::vector<const BenchmarkConfigSummary*>> grouped;
+    for (const auto& summary : snapshot.configs) grouped[summary.key.schedule].push_back(&summary);
+    std::vector<double> thread_samples;
+    thread_samples.reserve(snapshot.configs.size());
+    for (const auto& summary : snapshot.configs) thread_samples.push_back(static_cast<double>(summary.key.threads));
+    for (auto& [schedule, configs] : grouped) {
+      std::sort(configs.begin(), configs.end(), [](const BenchmarkConfigSummary* a, const BenchmarkConfigSummary* b) {
+        return a->key.threads < b->key.threads;
+      });
+      std::vector<double> xs, ys;
+      xs.reserve(configs.size());
+      ys.reserve(configs.size());
+      for (const auto* cfg : configs) {
+        xs.push_back(static_cast<double>(cfg->key.threads));
+        ys.push_back(cfg->efficiency);
+      }
+      ImU32 color = schedule == "serial" ? IM_COL32(223, 165, 91, 255) : schedule == "static" ? IM_COL32(102, 179, 255, 255) : IM_COL32(124, 214, 142, 255);
+      ImPlot::PlotLine(schedule.c_str(), xs.data(), ys.data(), static_cast<int>(xs.size()), ImPlotSpec{ImPlotProp_LineColor, color, ImPlotProp_Marker, ImPlotMarker_Circle, ImPlotProp_MarkerSize, 5.0f});
+    }
+    std::vector<double> ideal_y(thread_samples.size(), 1.0);
+    ImPlot::PlotLine("Ideal", thread_samples.data(), ideal_y.data(), static_cast<int>(ideal_y.size()), ImPlotSpec{ImPlotProp_LineColor, IM_COL32(255, 255, 255, 120), ImPlotProp_LineWeight, 1.5f});
+    show_point_tooltip([](const BenchmarkConfigSummary& summary) { return summary.efficiency; }, "Efficiency");
+    ImPlot::EndPlot();
+  }
+}
+
 static void draw_diagnostics_page(GuiAppState& state) {
   ImGui::TextUnformatted("Diagnostics / Self-Test");
   ImGui::Separator();
@@ -758,7 +1144,8 @@ static void draw_page(GuiAppState& state, SDL_Window* window, SDL_Renderer* rend
     case GuiAppState::Page::Home: draw_home_page(renderer, state); break;
     case GuiAppState::Page::Render: draw_render_page(window, state); break;
     case GuiAppState::Page::Benchmark: draw_benchmark_page(state); break;
-    case GuiAppState::Page::Results: draw_benchmark_page(state); break;
+    case GuiAppState::Page::Results: draw_results_page(window, state); break;
+    case GuiAppState::Page::Charts: draw_charts_page(window, state); break;
     case GuiAppState::Page::Diagnostics: draw_diagnostics_page(state); break;
   }
   ImGui::EndChild();
@@ -1064,6 +1451,7 @@ int run_gui_app(int argc, char** argv) {
   }
 
   ImGui::CreateContext();
+  ImPlot::CreateContext();
   ImGui::StyleColorsDark();
   state.base_style = ImGui::GetStyle();
   ImGuiIO& io = ImGui::GetIO();
@@ -1136,9 +1524,13 @@ int run_gui_app(int argc, char** argv) {
     state.job->cancel();
     state.job->join();
   }
+  if (state.results_worker.joinable()) {
+    state.results_worker.join();
+  }
 
   ImGui_ImplSDLRenderer3_Shutdown();
   ImGui_ImplSDL3_Shutdown();
+  ImPlot::DestroyContext();
   ImGui::DestroyContext();
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);

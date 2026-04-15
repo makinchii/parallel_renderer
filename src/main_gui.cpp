@@ -1,5 +1,5 @@
-#include "gui_app.h"
+#include "app.h"
 
 int main(int argc, char** argv) {
-  return pr::run_gui_app(argc, argv);
+  return pr::run_cli_app(argc, argv);
 }

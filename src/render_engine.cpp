@@ -23,14 +23,38 @@ inline std::uint64_t sample_seed(std::uint64_t base, int x, int y, int sample) {
   return hash64(base ^ (static_cast<std::uint64_t>(x) << 1) ^ (static_cast<std::uint64_t>(y) << 17) ^ (static_cast<std::uint64_t>(sample) << 33));
 }
 
+inline double filmic_aces(double x) {
+  constexpr double a = 2.51;
+  constexpr double b = 0.03;
+  constexpr double c = 2.43;
+  constexpr double d = 0.59;
+  constexpr double e = 0.14;
+  return std::clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+inline Vec3 sky_dome_color(const Vec3& unit_direction) {
+  auto t = 0.5 * (unit_direction.y + 1.0);
+  Vec3 horizon{0.78, 0.89, 1.00};
+  Vec3 zenith{0.30, 0.66, 0.98};
+  return (1.0 - t) * horizon + t * zenith;
+}
+
+inline Vec3 sky_with_clouds(const Vec3& unit_direction) {
+  auto base = sky_dome_color(unit_direction);
+  Vec3 sky_blue{0.33, 0.67, 0.99};
+  Vec3 lighter_blue{0.66, 0.84, 1.00};
+  return 0.72 * base + 0.28 * ((1.0 - 0.45 * (1.0 - std::clamp(unit_direction.y, -1.0, 1.0))) * lighter_blue +
+                               0.45 * sky_blue);
+}
+
 inline std::uint32_t pack_color(const Vec3& c, int samples_per_pixel) {
   auto scale = 1.0 / std::max(1, samples_per_pixel);
-  auto r = std::sqrt(std::clamp(c.x * scale, 0.0, 0.999));
-  auto g = std::sqrt(std::clamp(c.y * scale, 0.0, 0.999));
-  auto b = std::sqrt(std::clamp(c.z * scale, 0.0, 0.999));
-  auto ir = static_cast<std::uint32_t>(256.0 * r);
-  auto ig = static_cast<std::uint32_t>(256.0 * g);
-  auto ib = static_cast<std::uint32_t>(256.0 * b);
+  auto r = filmic_aces(c.x * scale);
+  auto g = filmic_aces(c.y * scale);
+  auto b = filmic_aces(c.z * scale);
+  auto ir = std::min<std::uint32_t>(255u, static_cast<std::uint32_t>(256.0 * r));
+  auto ig = std::min<std::uint32_t>(255u, static_cast<std::uint32_t>(256.0 * g));
+  auto ib = std::min<std::uint32_t>(255u, static_cast<std::uint32_t>(256.0 * b));
   return (ir << 16) | (ig << 8) | ib;
 }
 
@@ -51,6 +75,7 @@ inline Vec3 ray_color(const Ray& r, const Scene& world, int depth, Rng& rng) {
   HitRecord rec;
   if (world.hit(r, 0.001, std::numeric_limits<double>::infinity(), rec)) {
     const Material& m = *rec.material;
+    if (m.kind == MaterialKind::DiffuseLight) return m.emission;
     switch (m.kind) {
       case MaterialKind::Lambertian: {
         Vec3 scatter_dir = rec.normal + random_unit_vector(rng);
@@ -88,8 +113,7 @@ inline Vec3 ray_color(const Ray& r, const Scene& world, int depth, Rng& rng) {
   }
 
   Vec3 unit_direction = unit_vector(r.direction);
-  auto t = 0.5 * (unit_direction.y + 1.0);
-  return (1.0 - t) * Vec3{1.0, 1.0, 1.0} + t * Vec3{0.5, 0.7, 1.0};
+  return sky_with_clouds(unit_direction);
 }
 
 inline Vec3 render_pixel(const Scene& scene, const Camera& camera, const RenderConfig& config, int x, int y, ViewerState* viewer_state) {
@@ -126,15 +150,20 @@ inline void push_log(ViewerState* state, const std::string& msg) {
 
 inline void clear_viewer_state(ViewerState& state, int width, int height, const std::vector<Tile>& tiles) {
   std::lock_guard<std::mutex> lock(state.mutex);
-  state.framebuffer_ref().resize(width, height);
   state.tiles = tiles;
   state.tile_status.assign(tiles.size(), TileStatus{});
   state.tile_updates.clear();
+  state.tile_update_buffer.clear();
+  state.tile_update_buffer.reserve(tiles.size());
   state.tiles_completed.store(0);
   state.paused.store(false);
   state.cancelled.store(false);
   state.render_complete.store(false);
   state.logs.clear();
+  {
+    std::lock_guard<std::mutex> framebuffer_lock(state.framebuffer_mutex);
+    state.framebuffer_ref().resize(width, height);
+  }
 }
 
 }  // namespace
@@ -148,8 +177,8 @@ RenderStats render(const Scene& scene, const Camera& camera, Framebuffer& frameb
   }
 
   auto start = std::chrono::steady_clock::now();
-  auto render_tile = [&](const Tile& tile, int worker_id) {
-    std::vector<std::uint32_t> tile_pixels(static_cast<size_t>(tile.x1 - tile.x0) * static_cast<size_t>(tile.y1 - tile.y0));
+  auto render_tile = [&](const Tile& tile, int worker_id, std::vector<std::uint32_t>& tile_pixels) {
+    tile_pixels.resize(static_cast<size_t>(tile.x1 - tile.x0) * static_cast<size_t>(tile.y1 - tile.y0));
     for (int y = tile.y0; y < tile.y1; ++y) {
       if (viewer_state && viewer_state->cancelled.load()) return;
       for (int x = tile.x0; x < tile.x1; ++x) {
@@ -160,11 +189,16 @@ RenderStats render(const Scene& scene, const Camera& camera, Framebuffer& frameb
     }
     if (viewer_state) {
       std::lock_guard<std::mutex> lock(viewer_state->mutex);
-      commit_tile(framebuffer, tile, tile_pixels);
-      viewer_state->tile_status[static_cast<size_t>(tile.id)].state = TileState::Completed;
-      viewer_state->tile_status[static_cast<size_t>(tile.id)].worker_id = worker_id;
-      viewer_state->tile_status[static_cast<size_t>(tile.id)].end_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-      viewer_state->tile_updates.push_back(TileUpdate{tile.id, viewer_state->tile_status[static_cast<size_t>(tile.id)], std::move(tile_pixels)});
+      {
+        std::lock_guard<std::mutex> framebuffer_lock(viewer_state->framebuffer_mutex);
+        commit_tile(viewer_state->framebuffer_ref(), tile, tile_pixels);
+      }
+      TileStatus status = viewer_state->tile_status[static_cast<size_t>(tile.id)];
+      status.state = TileState::Completed;
+      status.worker_id = worker_id;
+      status.end_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      viewer_state->tile_status[static_cast<size_t>(tile.id)] = status;
+      viewer_state->tile_updates.push_back(TileUpdate{tile.id, status, std::move(tile_pixels)});
       viewer_state->tiles_completed.fetch_add(1);
     } else {
       commit_tile(framebuffer, tile, tile_pixels);
@@ -172,6 +206,7 @@ RenderStats render(const Scene& scene, const Camera& camera, Framebuffer& frameb
   };
 
   auto run_worker_range = [&](int begin, int end, int worker_id) {
+    std::vector<std::uint32_t> tile_pixels;
     for (int i = begin; i < end; ++i) {
       if (viewer_state && viewer_state->cancelled.load()) return;
       if (viewer_state && viewer_state->paused.load()) {
@@ -185,11 +220,12 @@ RenderStats render(const Scene& scene, const Camera& camera, Framebuffer& frameb
         viewer_state->tile_status[static_cast<size_t>(i)].worker_id = worker_id;
         viewer_state->tile_status[static_cast<size_t>(i)].start_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
       }
-      render_tile(tiles[static_cast<size_t>(i)], worker_id);
+      render_tile(tiles[static_cast<size_t>(i)], worker_id, tile_pixels);
     }
   };
 
   auto run_dynamic = [&](int worker_id, std::atomic<int>& next_tile) {
+    std::vector<std::uint32_t> tile_pixels;
     for (;;) {
       if (viewer_state && viewer_state->cancelled.load()) return;
       if (viewer_state && viewer_state->paused.load()) {
@@ -204,7 +240,7 @@ RenderStats render(const Scene& scene, const Camera& camera, Framebuffer& frameb
         viewer_state->tile_status[static_cast<size_t>(i)].worker_id = worker_id;
         viewer_state->tile_status[static_cast<size_t>(i)].start_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
       }
-      render_tile(tiles[static_cast<size_t>(i)], worker_id);
+      render_tile(tiles[static_cast<size_t>(i)], worker_id, tile_pixels);
     }
   };
 
